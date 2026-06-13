@@ -3,209 +3,77 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Glaux WKWebView 全双工实证 v2</title>
+<title>Glaux Voice Host</title>
 <style>
   :root { color-scheme: light; }
-  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 16px;
-         background: #F6F7FA; color: #1A1D2E; line-height: 1.6; }
-  h1 { font-size: 19px; margin: 4px 0 4px; }
-  .ver { font-size: 12px; color: #7A7F8E; margin-bottom: 12px; }
-  .card { background: #fff; border-radius: 14px; padding: 14px 16px; margin-bottom: 14px;
-          box-shadow: 0 1px 3px rgba(0,0,0,.06); }
-  button { font-size: 16px; padding: 12px 16px; border-radius: 12px; border: none;
-           background: #2B3A67; color: #fff; width: 100%; margin: 6px 0; }
-  button.stop { background: #B3261E; }
-  button:disabled { opacity: .35; }
-  .level-wrap { height: 22px; background: #E8EBF0; border-radius: 11px; overflow: hidden; margin: 8px 0; }
-  .level-bar { height: 100%; width: 0%; background: #27AE60; transition: width .05s linear; }
-  .big { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .label { font-size: 13px; color: #7A7F8E; }
-  .verdict { font-size: 15px; font-weight: 600; padding: 8px 10px; border-radius: 10px; margin-top: 8px; }
-  .ok { background: #E7F7EE; color: #1B7A45; }
-  .bad { background: #FDEAEA; color: #B3261E; }
-  .wait { background: #FFF4E0; color: #9A6700; }
-  .hint { font-size: 13px; color: #7A7F8E; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 24px 18px;
+         background: #2B3A67; color: #fff; line-height: 1.6; text-align: center; }
+  .logo { font-size: 22px; font-weight: 700; letter-spacing: 1px; margin-top: 12vh; }
+  .status { font-size: 17px; margin-top: 18px; opacity: .92; }
+  .sub { font-size: 13px; opacity: .6; margin-top: 8px; word-break: break-all; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#F0B429; margin-right:6px; vertical-align:middle; }
+  .dot.in { background:#27AE60; } .dot.err { background:#E74C3C; } .dot.end { background:#7A7F8E; }
 </style>
 </head>
 <body>
-<h1>WKWebView 全双工实证</h1>
-<div class="ver">页面版本 v2 · 判定=播放窗口内峰值过阈值(非瞬时最低值)</div>
-<p class="hint">命门:<b>播放音频期间,对手机说话时麦克风是否仍采到有效读数</b>。每次播放有 8 秒采样窗口(跳过起始 1 秒),<b>窗口内请持续说话</b>,看「窗口峰值」是否冲过阈值。可随时点「停止」。</p>
+  <div class="logo">Glaux</div>
+  <div class="status"><span class="dot" id="dot"></span><span id="s">初始化…</span></div>
+  <div class="sub" id="sub"></div>
 
-<div class="card">
-  <div class="label">当前麦克风电平(实时)</div>
-  <div class="big"><span id="lvl">--</span></div>
-  <div class="level-wrap"><div class="level-bar" id="bar"></div></div>
-  <div class="label">本段窗口峰值:<b id="peak">--</b> · 窗口内有效读数(&gt;阈值)次数:<b id="cnt">--</b></div>
-  <button id="btnStart">① 开始 · 授权麦克风</button>
-  <div id="micState" class="hint">未开始</div>
-</div>
+<script type="module">
+/*
+ * Glaux WebView 语音通话承载壳(零密钥)。
+ * @vapi-ai/web 经 CDN 载入;public key + assistant_id + session_id 由 App 经 WebView
+ * 消息桥运行时注入(window.__glauxStart),仓库内不含任何密钥。
+ * 后续优化(暂不做):生产把 SDK 自托管进本仓,去掉 CDN 外部依赖。
+ */
+import Vapi from 'https://esm.sh/@vapi-ai/web@2';
 
-<div class="card">
-  <div class="label">② HTML5 音频播放(MediaElement,RNW#3801 路径)</div>
-  <button id="btnHtml5" disabled>播放 audio(8 秒窗口,说话)</button>
-  <div id="vHtml5" class="verdict wait">待测</div>
-</div>
+var vapi = null;
+function post(msg) {
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(msg));
+}
+function setStatus(text, cls) {
+  document.getElementById('s').textContent = text;
+  var dot = document.getElementById('dot');
+  dot.className = 'dot' + (cls ? ' ' + cls : '');
+}
 
-<div class="card">
-  <div class="label">③ WebRTC 回环播放(贴近 Vapi:远端音轨边播边采)</div>
-  <button id="btnRtc" disabled>播放 WebRTC(8 秒窗口,说话,会有回声)</button>
-  <div id="vRtc" class="verdict wait">待测</div>
-</div>
-
-<div class="card hint">
-  阈值 = <span id="thv"></span>(说话时电平通常 30+,静默接近 0)<br>
-  UA:<span id="ua"></span><br>secure context:<b id="secure"></b>
-</div>
-
-<script>
-(function () {
-  var $ = function (id) { return document.getElementById(id); };
-  var THRESHOLD = 8;       // 有效读数阈值:高于环境静默
-  var WINDOW_MS = 8000;    // 采样窗口总长
-  var SKIP_MS = 1000;      // 跳过播放起始(避免起始静默/淡入的 0 误判)
-
-  $('thv').textContent = THRESHOLD;
-  $('ua').textContent = navigator.userAgent;
-  $('secure').textContent = String(window.isSecureContext);
-
-  var micStream = null, audioCtx = null, analyser = null, dataArr = null;
-  // 采样窗口状态
-  var windowActive = false, windowPeak = 0, windowCount = 0;
-
-  function curLevel() {
-    if (!analyser) return 0;
-    analyser.getByteTimeDomainData(dataArr);
-    var sum = 0;
-    for (var i = 0; i < dataArr.length; i++) { var v = (dataArr[i] - 128) / 128; sum += v * v; }
-    return Math.min(100, Math.round(Math.sqrt(sum / dataArr.length) * 300));
-  }
-  function loop() {
-    var lvl = curLevel();
-    $('lvl').textContent = lvl;
-    $('bar').style.width = lvl + '%';
-    if (windowActive) {
-      if (lvl > windowPeak) { windowPeak = lvl; $('peak').textContent = windowPeak; }
-      if (lvl > THRESHOLD) { windowCount++; $('cnt').textContent = windowCount; }
+// App → 页面:开始通话(注入凭据 + 绑定 session)
+window.__glauxStart = function (cfg) {
+  try {
+    if (vapi) return;
+    if (!cfg || !cfg.public_key || !cfg.assistant_id) {
+      setStatus('配置缺失', 'err'); post({ type: 'status', value: 'error', error: 'missing config' }); return;
     }
-    requestAnimationFrame(loop);
-  }
-
-  $('btnStart').onclick = function () {
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
-      micStream = s;
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
-      var src = audioCtx.createMediaStreamSource(s);
-      analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
-      dataArr = new Uint8Array(analyser.fftSize);
-      src.connect(analyser);
-      $('micState').innerHTML = '<b style="color:#1B7A45">麦克风已授权,采集中</b> — 说话上方电平应跳动';
-      $('btnStart').disabled = true; $('btnHtml5').disabled = false; $('btnRtc').disabled = false;
-      requestAnimationFrame(loop);
-    }).catch(function (e) {
-      $('micState').innerHTML = '<b style="color:#B3261E">getUserMedia 失败:' + e.name + ' — ' + e.message + '</b>';
+    setStatus('接通中…', null); post({ type: 'status', value: 'connecting' });
+    vapi = new Vapi(cfg.public_key);
+    vapi.on('call-start', function () { setStatus('通话中', 'in'); post({ type: 'status', value: 'in-call' }); });
+    vapi.on('call-end', function () { setStatus('已结束', 'end'); post({ type: 'status', value: 'ended' }); });
+    vapi.on('error', function (e) {
+      var m = (e && (e.message || e.error || e.errorMsg)) ? (e.message || e.error || e.errorMsg) : 'unknown';
+      setStatus('出错', 'err'); document.getElementById('sub').textContent = String(m);
+      post({ type: 'status', value: 'error', error: String(m) });
     });
-  };
-
-  // ---- 播放控制:单一活跃变体,可停止,采样窗口 + 判定 ----
-  var active = null;       // 'html5' | 'rtc' | null
-  var htmlAudio = null;
-  var pc1 = null, pc2 = null, rtcAudioEl = null;
-  var skipTimer = null, autoStopTimer = null;
-
-  function makeToneWavDataUri(freq, seconds, rate) {
-    var n = Math.floor(seconds * rate), buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
-    function ws(o, s) { for (var i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); }
-    ws(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE'); ws(12, 'fmt ');
-    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-    dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true);
-    dv.setUint16(34, 16, true); ws(36, 'data'); dv.setUint32(40, n * 2, true);
-    for (var i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.sin(2 * Math.PI * freq * i / rate) * 0.25 * 32767, true);
-    var bin = '', u8 = new Uint8Array(buf);
-    for (var j = 0; j < u8.length; j++) bin += String.fromCharCode(u8[j]);
-    return 'data:audio/wav;base64,' + btoa(bin);
+    // 仅用于调试可见,不回传(避免噪音);如需可放开 message 转发
+    vapi.on('speech-start', function () { post({ type: 'event', value: 'speech-start' }); });
+    vapi.on('speech-end', function () { post({ type: 'event', value: 'speech-end' }); });
+    // session 绑定:metadata.session_id → custom-llm 经 body.(call.)metadata.session_id 取
+    vapi.start(cfg.assistant_id, { metadata: { session_id: cfg.session_id } });
+  } catch (e) {
+    setStatus('启动失败', 'err'); document.getElementById('sub').textContent = String(e);
+    post({ type: 'status', value: 'error', error: String(e) });
   }
+};
 
-  function setButtons() {
-    $('btnHtml5').textContent = active === 'html5' ? '停止' : '播放 audio(8 秒窗口,说话)';
-    $('btnRtc').textContent = active === 'rtc' ? '停止' : '播放 WebRTC(8 秒窗口,说话,会有回声)';
-    $('btnHtml5').className = active === 'html5' ? 'stop' : '';
-    $('btnRtc').className = active === 'rtc' ? 'stop' : '';
-    // 互斥:一个在播时禁另一个
-    $('btnHtml5').disabled = !micStream || active === 'rtc';
-    $('btnRtc').disabled = !micStream || active === 'html5';
-  }
+// App → 页面:挂断
+window.__glauxHangup = function () {
+  try { if (vapi) vapi.stop(); } catch (e) {}
+};
 
-  function teardownPlayback() {
-    if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
-    if (autoStopTimer) { clearTimeout(autoStopTimer); autoStopTimer = null; }
-    windowActive = false;
-    if (htmlAudio) { try { htmlAudio.pause(); htmlAudio.currentTime = 0; } catch (e) {} }
-    if (rtcAudioEl) { try { rtcAudioEl.pause(); rtcAudioEl.srcObject = null; rtcAudioEl.remove(); } catch (e) {} rtcAudioEl = null; }
-    if (pc1) { try { pc1.close(); } catch (e) {} pc1 = null; }
-    if (pc2) { try { pc2.close(); } catch (e) {} pc2 = null; }
-  }
-
-  function startWindow(verdictEl, labelOk, labelBad) {
-    windowActive = false; windowPeak = 0; windowCount = 0;
-    $('peak').textContent = '0'; $('cnt').textContent = '0';
-    verdictEl.className = 'verdict wait';
-    verdictEl.textContent = '播放中(起始 1 秒不计)…窗口内持续说话,看「窗口峰值」。';
-    // 跳过起始 SKIP_MS 后开窗
-    skipTimer = setTimeout(function () { windowActive = true; }, SKIP_MS);
-    // WINDOW_MS 后自动结束 + 判定
-    autoStopTimer = setTimeout(function () {
-      finishWindow(verdictEl, labelOk, labelBad);
-    }, SKIP_MS + WINDOW_MS);
-  }
-
-  function finishWindow(verdictEl, labelOk, labelBad) {
-    var peak = windowPeak, cnt = windowCount;
-    stop(); // 停播放 + 复位按钮
-    var ok = peak >= THRESHOLD;   // 播放期间出现过有效读数 = 采集未被静音
-    verdictEl.className = 'verdict ' + (ok ? 'ok' : 'bad');
-    verdictEl.textContent = ok
-      ? ('✅ ' + labelOk + ':播放期间窗口峰值 ' + peak + '(≥' + THRESHOLD + '),有效读数 ' + cnt + ' 次 → 全双工可用')
-      : ('❌ ' + labelBad + ':播放期间窗口峰值仅 ' + peak + '(<' + THRESHOLD + ')。若你当时确实在说话→疑似互斥;若没说话→请重测并在窗口内说话');
-  }
-
-  function stop() {
-    teardownPlayback();
-    active = null;
-    setButtons();
-  }
-
-  $('btnHtml5').onclick = function () {
-    if (active === 'html5') { finishWindow($('vHtml5'), 'HTML5', 'HTML5'); return; }
-    if (active) return;
-    active = 'html5'; setButtons();
-    if (!htmlAudio) { htmlAudio = new Audio(makeToneWavDataUri(440, 1, 16000)); htmlAudio.loop = true; htmlAudio.volume = 0.4; }
-    var p = htmlAudio.play();
-    if (p && p.catch) p.catch(function (e) { $('vHtml5').className = 'verdict bad'; $('vHtml5').textContent = 'audio.play() 失败:' + e.name; stop(); });
-    startWindow($('vHtml5'), 'HTML5', 'HTML5');
-  };
-
-  $('btnRtc').onclick = function () {
-    if (active === 'rtc') { finishWindow($('vRtc'), 'WebRTC', 'WebRTC'); return; }
-    if (active || !micStream) return;
-    active = 'rtc'; setButtons();
-    pc1 = new RTCPeerConnection(); pc2 = new RTCPeerConnection();
-    pc1.onicecandidate = function (e) { if (e.candidate) pc2.addIceCandidate(e.candidate); };
-    pc2.onicecandidate = function (e) { if (e.candidate) pc1.addIceCandidate(e.candidate); };
-    pc2.ontrack = function (e) {
-      rtcAudioEl = document.createElement('audio'); rtcAudioEl.autoplay = true;
-      rtcAudioEl.setAttribute('playsinline', ''); rtcAudioEl.srcObject = e.streams[0];
-      document.body.appendChild(rtcAudioEl);
-    };
-    micStream.getAudioTracks().forEach(function (t) { pc1.addTrack(t, micStream); });
-    pc1.createOffer().then(function (o) { return pc1.setLocalDescription(o).then(function () { return pc2.setRemoteDescription(o); }); })
-      .then(function () { return pc2.createAnswer(); })
-      .then(function (a) { return pc2.setLocalDescription(a).then(function () { return pc1.setRemoteDescription(a); }); })
-      .catch(function (e) { $('vRtc').className = 'verdict bad'; $('vRtc').textContent = 'WebRTC 建立失败:' + e.name + ' — ' + e.message; stop(); });
-    startWindow($('vRtc'), 'WebRTC(贴近 Vapi)', 'WebRTC');
-  };
-})();
+// 页面就绪 → 通知 App 注入配置(握手,避免 race)
+setStatus('就绪,等待接入…', null);
+post({ type: 'ready' });
 </script>
 </body>
 </html>
