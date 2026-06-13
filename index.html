@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Glaux WKWebView 全双工实证</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; margin: 0; padding: 16px;
+         background: #F6F7FA; color: #1A1D2E; line-height: 1.6; }
+  h1 { font-size: 19px; margin: 4px 0 12px; }
+  .card { background: #fff; border-radius: 14px; padding: 14px 16px; margin-bottom: 14px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  button { font-size: 16px; padding: 12px 16px; border-radius: 12px; border: none;
+           background: #2B3A67; color: #fff; width: 100%; margin: 6px 0; }
+  button:disabled { opacity: .4; }
+  .level-wrap { height: 22px; background: #E8EBF0; border-radius: 11px; overflow: hidden; margin: 8px 0; }
+  .level-bar { height: 100%; width: 0%; background: #27AE60; transition: width .05s linear; }
+  .big { font-size: 32px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .label { font-size: 13px; color: #7A7F8E; }
+  .verdict { font-size: 15px; font-weight: 600; padding: 8px 10px; border-radius: 10px; margin-top: 8px; }
+  .ok { background: #E7F7EE; color: #1B7A45; }
+  .bad { background: #FDEAEA; color: #B3261E; }
+  .wait { background: #FFF4E0; color: #9A6700; }
+  .hint { font-size: 13px; color: #7A7F8E; }
+</style>
+</head>
+<body>
+<h1>WKWebView 全双工实证</h1>
+<p class="hint">目的:验证 <b>播放音频的同时麦克风采集是否仍有读数</b>(全双工)。各步骤<b>对着手机说话</b>,看下方电平条是否随说话跳动。电平在播放期间归零不动 = 踩中互斥。</p>
+
+<div class="card">
+  <div class="label">当前麦克风电平</div>
+  <div class="big"><span id="lvl">--</span></div>
+  <div class="level-wrap"><div class="level-bar" id="bar"></div></div>
+  <div class="label">本段播放期间最低电平(说话时):<b id="minlvl">--</b></div>
+  <button id="btnStart">① 开始 · 授权麦克风</button>
+  <div id="micState" class="hint">未开始</div>
+</div>
+
+<div class="card">
+  <div class="label">② HTML5 音频播放(MediaElement,对应 RNW#3801 路径)</div>
+  <button id="btnHtml5" disabled>播放 audio 循环音(说话观察电平,8 秒)</button>
+  <div id="vHtml5" class="verdict wait">待测</div>
+</div>
+
+<div class="card">
+  <div class="label">③ WebRTC 回环播放(贴近 Vapi:远端音轨边播边采)</div>
+  <button id="btnRtc" disabled>播放 WebRTC 回环(说话观察电平,会有回声属正常,8 秒)</button>
+  <div id="vRtc" class="verdict wait">待测</div>
+</div>
+
+<div class="card hint">
+  UA:<span id="ua"></span><br>secure context:<b id="secure"></b>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  $('ua').textContent = navigator.userAgent;
+  $('secure').textContent = String(window.isSecureContext);
+
+  var micStream = null, audioCtx = null, analyser = null, dataArr = null;
+  var minTracking = false, minLevel = 100;
+
+  function levelFromAnalyser() {
+    if (!analyser) return 0;
+    analyser.getByteTimeDomainData(dataArr);
+    var sum = 0;
+    for (var i = 0; i < dataArr.length; i++) { var v = (dataArr[i] - 128) / 128; sum += v * v; }
+    var rms = Math.sqrt(sum / dataArr.length);
+    return Math.min(100, Math.round(rms * 300));
+  }
+  function loop() {
+    var lvl = levelFromAnalyser();
+    $('lvl').textContent = lvl;
+    $('bar').style.width = lvl + '%';
+    if (minTracking && lvl < minLevel) { minLevel = lvl; $('minlvl').textContent = minLevel; }
+    requestAnimationFrame(loop);
+  }
+  function startMinTracking() { minLevel = 100; minTracking = true; $('minlvl').textContent = '--'; }
+
+  $('btnStart').onclick = function () {
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+      micStream = s;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      var src = audioCtx.createMediaStreamSource(s);
+      analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
+      dataArr = new Uint8Array(analyser.fftSize);
+      src.connect(analyser);
+      $('micState').innerHTML = '<b style="color:#1B7A45">麦克风已授权,采集中</b> — 对手机说话,上方电平应跳动';
+      $('btnStart').disabled = true; $('btnHtml5').disabled = false; $('btnRtc').disabled = false;
+      requestAnimationFrame(loop);
+    }).catch(function (e) {
+      $('micState').innerHTML = '<b style="color:#B3261E">getUserMedia 失败:' + e.name + ' — ' + e.message + '</b>(权限拒绝=B/系统拦截;NotReadable/NotFound=路不通迹象)';
+    });
+  };
+
+  function makeToneWavDataUri(freq, seconds, rate) {
+    var n = Math.floor(seconds * rate), bytes = 44 + n * 2, buf = new ArrayBuffer(bytes), dv = new DataView(buf);
+    function ws(o, s) { for (var i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); }
+    ws(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true); dv.setUint16(32, 2, true);
+    dv.setUint16(34, 16, true); ws(36, 'data'); dv.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) { var v = Math.sin(2 * Math.PI * freq * i / rate) * 0.25; dv.setInt16(44 + i * 2, v * 32767, true); }
+    var bin = ''; var u8 = new Uint8Array(buf);
+    for (var j = 0; j < u8.length; j++) bin += String.fromCharCode(u8[j]);
+    return 'data:audio/wav;base64,' + btoa(bin);
+  }
+
+  var htmlAudio = null;
+  $('btnHtml5').onclick = function () {
+    if (!htmlAudio) { htmlAudio = new Audio(makeToneWavDataUri(440, 1, 16000)); htmlAudio.loop = true; htmlAudio.volume = 0.4; }
+    startMinTracking();
+    var p = htmlAudio.play();
+    $('vHtml5').className = 'verdict wait';
+    $('vHtml5').textContent = '播放中…对手机说话 8 秒,观察电平与「最低电平」。';
+    if (p && p.catch) p.catch(function (e) { $('vHtml5').className = 'verdict bad'; $('vHtml5').textContent = 'audio.play() 失败:' + e.name; });
+    setTimeout(function () {
+      htmlAudio.pause(); minTracking = false;
+      var ok = minLevel > 3;
+      $('vHtml5').className = 'verdict ' + (ok ? 'ok' : 'bad');
+      $('vHtml5').textContent = ok
+        ? '✅ HTML5 播放期间麦克风仍有读数(最低 ' + minLevel + ')→ 全双工通过'
+        : '❌ HTML5 播放期间电平几乎归零(最低 ' + minLevel + ')→ 疑似互斥(确认说话了仍归零才算)';
+    }, 8000);
+  };
+
+  $('btnRtc').onclick = function () {
+    if (!micStream) return;
+    startMinTracking();
+    $('vRtc').className = 'verdict wait';
+    $('vRtc').textContent = 'WebRTC 回环建立中…接通后对手机说话 8 秒(会听到自己回声=远端音轨在播)。';
+    var pc1 = new RTCPeerConnection(), pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = function (e) { if (e.candidate) pc2.addIceCandidate(e.candidate); };
+    pc2.onicecandidate = function (e) { if (e.candidate) pc1.addIceCandidate(e.candidate); };
+    pc2.ontrack = function (e) {
+      var a = document.createElement('audio'); a.autoplay = true; a.srcObject = e.streams[0];
+      a.setAttribute('playsinline', ''); document.body.appendChild(a);
+    };
+    micStream.getAudioTracks().forEach(function (t) { pc1.addTrack(t, micStream); });
+    pc1.createOffer().then(function (o) { return pc1.setLocalDescription(o).then(function () { return pc2.setRemoteDescription(o); }); })
+      .then(function () { return pc2.createAnswer(); })
+      .then(function (a) { return pc2.setLocalDescription(a).then(function () { return pc1.setRemoteDescription(a); }); })
+      .catch(function (e) { $('vRtc').className = 'verdict bad'; $('vRtc').textContent = 'WebRTC 建立失败:' + e.name + ' — ' + e.message; });
+    setTimeout(function () {
+      minTracking = false;
+      var ok = minLevel > 3;
+      $('vRtc').className = 'verdict ' + (ok ? 'ok' : 'bad');
+      $('vRtc').textContent = ok
+        ? '✅ WebRTC 远端音轨播放期间麦克风仍有读数(最低 ' + minLevel + ')→ 贴近 Vapi 的全双工通过'
+        : '❌ WebRTC 播放期间电平几乎归零(最低 ' + minLevel + ')→ 疑似互斥';
+      try { pc1.close(); pc2.close(); } catch (e) {}
+    }, 8000);
+  };
+})();
+</script>
+</body>
+</html>
