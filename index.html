@@ -27,7 +27,10 @@
  * 消息桥运行时注入(window.__glauxStart),仓库内不含任何密钥。
  * 后续优化(暂不做):生产把 SDK 自托管进本仓,去掉 CDN 外部依赖。
  */
-import Vapi from 'https://esm.sh/@vapi-ai/web@2';
+// SDK 版本锁定:@2 → @2.5.2(2026-06-14,调试纪律,消除 esm.sh 每次解析最新 2.x 的漂移)。
+// 升级时改这一行的版本号。运行期可在 Safari Inspector console 核对下方 log。
+import Vapi from 'https://esm.sh/@vapi-ai/web@2.5.2';
+console.log('[glaux-voice-host] @vapi-ai/web locked @2.5.2');
 
 var vapi = null;
 function post(msg) {
